@@ -1,0 +1,169 @@
+// Interface subclasses
+class PktIn  :: Packet(in)  {}
+class PktOut :: Packet(out) {}
+class MetadataIn :: Tuple(in) {
+    struct {
+        is_dns : 1  // Whether packet is DNS
+    }
+}
+class MetadataOut :: Tuple(out) {
+    struct {
+        is_dns : 1  // Whether packet is DNS
+    }
+}
+
+class DNS :: System {
+
+    PktIn    instream;
+    PktOut   outstream;
+
+    DNS_Parser parser;
+    DNS_Editor editor;
+
+    method connect = {
+
+        parser.packet_in = instream,
+
+        editor.packet_in = parser.packet_out,
+        editor.tuple_in  = parser.tuple_out,
+
+        outstream = editor.packet_out
+
+    }
+
+} // DNS
+
+class DNS_Parser :: ParsingEngine(12000, 5, ETH) {
+
+    // Constants
+    const VLAN_TYPE = 0x8100;
+    const IPV4_TYPE = 0x0800;
+    const IPV6_TYPE = 0x86dd;
+    // const TCP_TYPE = 0x06;
+    const UDP_TYPE = 0x11;
+    const SUCCESS = 0;
+    const FAILURE = 1;
+
+    MetadataOut tuple_out;
+
+    // Ethernet MAC header
+    class ETH :: Section(1) {
+        struct {
+            skip : 96, // Skip fields
+            type : 16  // Tag Protocol Identifier
+        }
+        // ETH can be followed by VLAN, IPV4 or IPV6
+        map types {
+            (VLAN_TYPE, VLAN),
+            (IPV4_TYPE, IPV4),
+            (IPV6_TYPE, IPV6),
+            done(SUCCESS)
+        }
+        // Initialise tuple
+        method update = {
+            tuple_out.is_dns = 0
+        }
+        // Identify following protocol
+        method move_to_section = types(type);
+        // Move to following protocol
+        method increment_offset = sizeof(ETH);
+    } // ETH
+
+    // VLAN header
+    class VLAN :: Section(2:3) {
+        struct {
+            skip : 16, // Skip fields
+            tpid : 16  // Tag Protocol Identifier
+        }
+        // VLAN can be followed by VLAN, IPV4 or IPV6
+        map types {
+            (VLAN_TYPE, VLAN),
+            (IPV4_TYPE, IPV4),
+            (IPV6_TYPE, IPV6),
+            done(SUCCESS)
+        }
+        // Identify following protocol
+        method move_to_section = types(tpid);
+        // Move to following protocol
+        method increment_offset = sizeof(VLAN);
+    } // VLAN
+
+    // IPV4 header
+    class IPV4 :: Section(2:4) {
+        struct {
+            version : 4,  // Version (4)
+            hdrlen  : 4,  // Header Length
+            skip    : 64, // Skip fields
+            proto   : 8   // Next Protocol
+        }
+        // IPV4 can be followed by TCP
+        map types {
+            (UDP_TYPE, UDP),
+            done(SUCCESS)
+        }
+        // Identify following protocol
+        method move_to_section = types(proto);
+        // Move to following protocol
+        method increment_offset = hdrlen * 32;
+    } // IPV4
+
+    // IPV6 header
+    class IPV6 :: Section(2:4) {
+        struct {
+            skip    : 48, // Skip fields
+            nexthdr : 8   // Next Header
+        }
+        // IPV4 can be followed by TCP
+        map types {
+            (UDP_TYPE, UDP),
+            done(SUCCESS)
+        }
+        // Identify following protocol
+        method move_to_section = types(nexthdr);
+        // Move to following protocol
+        method increment_offset = 320;
+    }
+
+    // UDP header
+    class UDP :: Section(3:5) {
+        struct {
+            srcport : 16, // Source Port
+            dstport : 16  // Destination Port
+        }
+        // Flag as DNS
+        method update = {
+            tuple_out.is_dns = (srcport == 53) || (dstport == 53)
+        }
+        // Identify following protocol
+        method move_to_section = done(SUCCESS);
+        // Move to following protocol
+        method increment_offset = 0;
+    } // UDP   
+
+} // DNS_Parser
+
+class DNS_Editor :: EditingEngine(12000, 2, FETCH) {
+
+    // Constants
+    const SUCCESS = 0;
+    const FAILURE = 1;
+
+    MetadataIn tuple_in;
+
+    class FETCH :: Section(1) {
+        // Drop only non-DNS packets
+        method move_to_section =
+            if (tuple_in.is_dns == 0) DROP
+            else done(SUCCESS);
+        method increment_offset = 0;
+    } // FETCH
+
+    class DROP :: Section(2) {
+        // Remove whole packet
+        method remove = rop();
+        // Finish engine
+        method move_to_section = done(SUCCESS);
+        method increment_offset = 0;
+    } // DROP
+
+} // DNS_Editor
